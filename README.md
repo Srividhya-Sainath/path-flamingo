@@ -21,3 +21,7 @@ The dataset used for Path-Flamingo is curated from repositories such as **TCGA**
 - **Advanced Applications**: Enables tasks such as visual question answering, diagnostic reasoning, and pathology report generation.  
 
 By reducing the computational complexity and aligning visual and textual data effectively, Path-Flamingo is designed to make significant strides in pathology AI research and clinical applications. It offers a streamlined yet powerful solution to unlock the full potential of multimodal data in pathology.
+
+## Acknowledgments
+
+This project builds upon several outstanding repositories and tools. **OpenFlamingo** was instrumental in model training, **TITAN** and **COBRA** provided essential vision features for WSIs, and **Hugging Face Transformers** supported tokenization. We extend our gratitude to the authors and developers of these resources for their valuable contributions, which made this work possible.
