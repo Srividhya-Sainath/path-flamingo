@@ -8,7 +8,7 @@ import random
 import numpy as np
 import torch
 import wandb
-from open_flamingo.open_flamingo.train.data import get_data
+from open_flamingo.train.data import get_data
 from distributed import init_distributed_device, world_info_from_env
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -51,11 +51,14 @@ def random_seed(seed=42, rank=0):
 
 def main():
     parser = argparse.ArgumentParser()
+    # model configuration args
+    # parser.add_argument("--vision_encoder_path", default="ViT-L-14", type=str)
+    # parser.add_argument("--vision_encoder_pretrained", default="openai", type=str)
     parser.add_argument("--lm_path", default="facebook/opt-1.3b", type=str)
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=64,  # Match the default in PathDataset
+        default=256,  # Match the default in PathDataset
         help="Maximum number of tokens to process for each input",
         )
     parser.add_argument(
@@ -131,6 +134,18 @@ def main():
         "--logging_steps", type=int, default=100, help="log loss every n steps"
     )
 
+    # data args
+    # parser.add_argument(
+    #     "--laion_shards",
+    #     type=str,
+    #     help="path to laion shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
+    # )
+    # parser.add_argument(
+    #     "--mmc4_shards",
+    #     type=str,
+    #     help="path to c4 shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
+    # )
+
     ## data args TCGA and GTEX ka daalna hai
     parser.add_argument(
         "--tcga_vision_features",
@@ -156,6 +171,24 @@ def main():
     parser.add_argument("--train_num_samples_tcga", type=int, default=10000)
     parser.add_argument("--train_num_samples_gtex", type=int, default=10000)
     parser.add_argument("--dataset_resampled", action="store_true")
+    # parser.add_argument(
+    #     "--mmc4_textsim_threshold",
+    #     default=30,
+    #     type=float,
+    #     help="threshold for filtering images in mmc4 based on image-text similarity",
+    # )
+    # parser.add_argument(
+    #     "--mmc4_max_num_images",
+    #     default=6,
+    #     type=int,
+    #     help="max number of images per sequence in mmc4 / chatgpt",
+    # )
+    # parser.add_argument(
+    #     "--mmc4_min_num_images",
+    #     default=1,
+    #     type=int,
+    #     help="min number of images per sequence in mmc4 / chatgpt",
+    # )
 
     # distributed training args
     parser.add_argument(
@@ -213,6 +246,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Validate args
+    ## यह दोनों तो पक्का नहीं चाहिए होंगे।
+    # if args.laion_shards.startswith("s3"):
+    #     args.laion_shards = f"pipe:aws s3 cp {args.laion_shards} -"
+
+    # if args.mmc4_shards.startswith("s3"):
+    #     args.mmc4_shards = f"pipe:aws s3 cp {args.mmc4_shards} -"
 
     if args.save_checkpoints_to_wandb and not args.report_to_wandb:
         raise ValueError("save_checkpoints_to_wandb requires report_to_wandb")
