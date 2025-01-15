@@ -8,7 +8,7 @@ import random
 import numpy as np
 import torch
 import wandb
-from open_flamingo.train.data import get_data
+from path_flamingo.train.data import get_data
 from distributed import init_distributed_device, world_info_from_env
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -40,7 +40,7 @@ from torch.distributed.fsdp._init_utils import _init_intra_and_inter_node_groups
 from torch.distributed.distributed_c10d import _get_default_group
 import functools
 
-from open_flamingo import create_model_and_transforms
+from path_flamingo import create_model_and_transforms
 
 
 def random_seed(seed=42, rank=0):
