@@ -38,7 +38,7 @@ class Flamingo(nn.Module):
         super().__init__()
         self.eoc_token_id = eoc_token_id
         self.media_token_id = media_token_id
-        self.vis_dim = vis_dim # Ideally 768 hona chahiye. Both TITAN anc CONCHv1.5 ka 768 hi hai
+        self.vis_dim = vis_dim # Ideally 768 hona chahiye. Both TITAN and CONCHv1.5 ka 768 hi hai
         if hasattr(lang_encoder.config, "d_model"):
             self.lang_dim = lang_encoder.config.d_model  # mpt uses d_model
         else:
@@ -162,6 +162,8 @@ class Flamingo(nn.Module):
         if num_beams > 1:
             vision_x = vision_x.repeat_interleave(num_beams, dim=0)
 
+        self.lang_encoder.cached_input_ids = lang_x # Cache text tokens for `_encode_vision_x()`
+
         self.lang_encoder._use_cached_vision_x = True
         self._encode_vision_x(vision_x=vision_x)
 
@@ -176,25 +178,24 @@ class Flamingo(nn.Module):
 
         self.lang_encoder.clear_conditioned_layers()
         self.lang_encoder._use_cached_vision_x = False
+        del self.lang_encoder.cached_input_ids
         return output
     
     def _encode_vision_x(self, vision_x: torch.Tensor):
         """
         Prepare global embeddings to align with (B, T_img, F, V, D) format.
+
         Args:
-            vision_x (torch.Tensor): Precomputed image embeddings of shape (B, D).
-                B: Batch size, D: Embedding dimension.
-        Returns:
-            None: Updates self.lang_encoder's conditioned vision embeddings.
-            """
-        assert vision_x.ndim == 2, "vision_x should be of shape (B, D)"
-        b, d = vision_x.shape
-        
-        # Reshape to match (B, T_img, F, V, D)
-        vision_x = vision_x.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B, 1, 1, 1, D)
+            vision_x (torch.Tensor): Precomputed image embeddings of shape (B, T_img, D)
+        """
+        assert vision_x.ndim == 4, "Expected shape [B, Tm, V, D]"
+        B, T_img, V, D = vision_x.shape
+
+        # Reshape to match (B, T_img, F=1, V=1, D)
+        vision_x = vision_x.view(B, T_img, 1, V, D)
+
         vision_x = self.perceiver(vision_x)
 
-        # Update language model's conditioned embeddings
         for layer in self.lang_encoder._get_decoder_layers():
             layer.condition_vis_x(vision_x)
 
@@ -334,4 +335,4 @@ class Flamingo(nn.Module):
         Clear all conditioning.
         """
         self.lang_encoder.clear_conditioned_layers()
-        self.lang_encoder._use_cached_vision_x = False(base)
+        self.lang_encoder._use_cached_vision_x = False
