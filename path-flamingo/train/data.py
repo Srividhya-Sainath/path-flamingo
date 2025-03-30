@@ -1,13 +1,14 @@
 """
 Preprocess and load datasets for training.
 """
-
 import json
 import math
 import re
-# from scipy.optimize import linear_sum_assignment ## इसकी ज़रूरत नहीं है क्योंकि Similarity Matrix वगैरह अभी नहीं चाहिए। हमारे पास तो पहले से ही matched captions हैं।
-
-from data_utils import *
+import torch
+import random
+import numpy as np
+from open_flamingo.train.data_utils import *
+from train_utils import get_cast_dtype
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -17,156 +18,199 @@ try:
 except ImportError:
     hvd = None
 
-
 class PathDataset(Dataset):
-    def __init__(self, jsonl_file, tokenizer, feature_loader, max_tokens=256):
-        """
-        Custom Dataset for JSONL data with preprocessing.
-
-        Args:
-            jsonl_file (str): Path to the JSONL file.
-            tokenizer: Tokenizer for text preprocessing.
-            image_processor (function): Placeholder for image preprocessing function.
-            max_tokens (int): Maximum token length for truncation.
-        """
+    def __init__(self, jsonl_file, tokenizer, feature_loader, cohort="tcga",
+                 max_tokens=256, min_images=1, max_images=4):
         self.jsonl_file = jsonl_file
         self.tokenizer = tokenizer
         self.feature_loader = feature_loader
-        #self.image_processor = image_processor or (lambda x: x)  # Placeholder. Didi yahaan TITAN aega 
+        self.cohort = cohort
         self.max_tokens = max_tokens
-        self.data = self._load_and_preprocess()
+        self.min_images = min_images
+        self.max_images = max_images
+        self.data = self._load_entries()
 
-    def _load_and_preprocess(self):
-        """
-        Load and preprocess the JSONL file.
-        """
-        processed_data = []
+    def _load_entries(self):
+        entries = []
         with open(self.jsonl_file, "r") as file:
             for line in file:
-                
-                entry = json.loads(line) # Parse each line as a JSON object
+                entry = json.loads(line)
+                entries.append(entry)
+        return entries
 
-                
-                file_path = entry["file_path"] # Get file_path (image ID) and preprocess text
-                result = entry["result"]
+    def _process_text(self, text):
+        text = re.sub(r"\n\s+", "\n\n", text)
+        user_index = text.find("\n\nUser:")
+        if user_index != -1:
+            text = text[user_index:]
+        text = text.replace("\n\nUser:", "<image>", 1)
+        text = text.replace("\nUser:", "<image>", 1)
+        text = text.replace("User:", "<image>", 1)
+        text = re.sub(r"\n\nUser:", "<|endofchunk|>\n<image>", text)
+        text = text.replace("\n\nAssistant:", "\nAnswer:")
+        text = text.replace("\nAssistant:", "\nAnswer:")
+        text = text.replace("Assistant:", "\nAnswer:")
+        text = text.replace("\n\nPathology Assistant:", "\nAnswer:")
+        text = text.replace("\nPathology Assistant:", "\nAnswer:")
+        text = text.replace("Pathology Assistant:", "\nAnswer:")
+        #return text
+        lines = text.strip().split("\n")
+        new_lines = []
+        inside_answer = False
 
-                # if self.tokenizer.pad_token is None: # Iski Zaroorat nahi hai kyunki iska solution factory.py mein implement kiya hai
-                #     self.tokenizer.pad_token = self.tokenizer.eos_token # अगर Tokenizer के पास कोई Padding token नहीं है तो EOS token का use कर लें
+        for i, line in enumerate(lines):
+            new_lines.append(line)
 
-                result = entry["result"]
-                result = re.sub(r"\n\s+", "\n\n", result)
+            if line.strip().startswith("Answer:"):
+                inside_answer = True
+            elif inside_answer and (
+                i == len(lines) - 1 or lines[i + 1].strip().startswith("<image>")
+            ):
+                if not line.strip().endswith("<|endofchunk|>"):
+                    new_lines[-1] = new_lines[-1].strip() + " <|endofchunk|>"
+                inside_answer = False
 
-                ## यहाँ से शुरू होती है text preprocessing का झमेला!
-                # Step 1: Remove lines before the first "User:"
-                user_index = result.find("\n\nUser:")
-                if user_index != -1:
-                    result = result[user_index:]
-            
-                # Step 2: Replace the first "User:" with "<image>" (without <|endofchunk|>)
-                result = result.replace("\n\nUser:", "<image>", 1)
-                result = result.replace("User:", "<image>", 1)
-
-                # Step 3: Add <|endofchunk|> before every subsequent <image>
-                result = re.sub(
-                    r"\n\nUser:", "<|endofchunk|>\n<image>", result
-                )
-                result = result.replace("\n\nAssistant:", "\nAnswer:")
-                result = result.replace("\n\nPathology Assistant:", "\nAnswer:")
-
-                lines = result.split("\n")
-                for i, line in enumerate(lines):
-                    if line.startswith("Answer:"):
-                    # Check if the line already ends with <|endofchunk|>
-                        if not line.endswith("<|endofchunk|>"):
-                            lines[i] = line.strip() + " <|endofchunk|>"
-                result = "\n".join(lines)
-                pairs = result.split("<image>")
-                for pair in pairs:
-                    if pair.strip():  # Ignore empty pairs
-                        pair_text = "<image>" + pair.strip()
-                        if not pair_text.endswith("<|endofchunk|>"):
-                            pair_text += " <|endofchunk|>"
-
-                        text = self.tokenizer(
-                            pair_text,
-                            max_length=self.max_tokens,
-                            truncation=True,
-                            padding="max_length",
-                            return_tensors="pt",
-                        )
-
-                        # Yahaan mein image ke features load kar rahi hun
-                        features = self.feature_loader(file_path)
-
-                        # Processed data contains: (file_path, input_ids, attention_mask)
-                        ## file_path में ideally CONCHV1.5 के features आने चाहिए। - TODO
-                        processed_data.append((file_path, features, text["input_ids"], text["attention_mask"], pair_text))
-        return processed_data
+        return "\n".join(new_lines)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        file_path, features, input_ids, attention_mask, raw_text = self.data[idx]
-        # Preprocess the image using the placeholder processor
-        #image = self.image_processor(file_path)  # TODO - ADD TITAN HERE Placeholder (Maybe Later. Pehle h5 files se chala lo)
+        entry = self.data[idx]
+        file_path = entry["file_path"]
+        result = self._process_text(entry["result"])
+
+        parts = result.split("<image>")
+        num_image_tokens = len(parts) - 1
+
+        truncated_result = "<image>".join(parts[:num_image_tokens + 1])
+        lines = truncated_result.split("\n")
+        for i, line in enumerate(lines):
+            if line.startswith("Answer:") and not line.endswith("<|endofchunk|>"):
+                lines[i] = line.strip() + " <|endofchunk|>"
+        truncated_result = "\n".join(lines)
+
+        text = self.tokenizer(
+            truncated_result,
+            max_length=self.max_tokens,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+        feature = self.feature_loader(file_path)
+        if isinstance(feature, np.ndarray):
+            feature = torch.tensor(feature, dtype=torch.float32)
+
+        if feature.ndim == 1:
+            # Case: shape [768] → make it [1, 768]
+            feature = feature.unsqueeze(0)
+        elif feature.ndim == 2:
+            # Case: shape already [image_tokens_per_image, 768]
+            pass
+        else:
+            raise ValueError(f"Unexpected feature shape: {feature.shape}")
+
+        # Repeat along Tm (number of <image> tokens)
+        repeated = feature.unsqueeze(0).repeat(num_image_tokens, 1, 1)  # [Tm, image_tokens_per_image, 768]
+
         return {
             "file_path": file_path,
-            "image": features,
-            "input_ids": input_ids.squeeze(0),  # Remove batch dimension
-            "attention_mask": attention_mask.squeeze(0),
-            "raw_text": raw_text,
+            "raw_text": truncated_result,
+            "input_ids": text["input_ids"].squeeze(0),
+            "attention_mask": text["attention_mask"].squeeze(0),
+            "features": repeated,  # shape: [Tm, image_tokens_per_image, 768]
+            "token_count": num_image_tokens
         }
 
+def greedy_collate_fn(batch, max_total_image_tokens=10, min_images=1, cast_dtype=None):
+    batch_size = len(batch)
+
+    # Step 1: Initial allocation (safe)
+    token_allocations = [
+        min(sample["token_count"], max(min_images, max_total_image_tokens // batch_size))
+        for sample in batch
+    ]
+    remaining_budget = max_total_image_tokens - sum(token_allocations)
+
+    # Step 2: Greedy top-up
+    indices = list(range(batch_size))
+    random.shuffle(indices)
+    for idx in indices:
+        sample = batch[idx]
+        available = sample["token_count"] - token_allocations[idx]
+        if available > 0 and remaining_budget > 0:
+            give = min(available, remaining_budget)
+            token_allocations[idx] += give
+            remaining_budget -= give
+        if remaining_budget <= 0:
+            break
+
+    # Step 3: Pad each sample to max_alloc (only along Tm)
+    max_alloc = max(token_allocations)
+    padded_features = []
+    for alloc, sample in zip(token_allocations, batch):
+        feats = sample["features"][:alloc]  # shape: [alloc, image_tokens_per_image, 768]
+        pad_len = max_alloc - alloc
+        if pad_len > 0:
+            pad = torch.zeros(
+                (pad_len, feats.shape[1], feats.shape[2]), dtype=feats.dtype
+            )
+            feats = torch.cat([feats, pad], dim=0)
+        padded_features.append(feats)
+
+    images = torch.stack(padded_features)  # [B, max_alloc, image_tokens_per_image, 768]
+    if cast_dtype is not None:
+        images = images.to(dtype=cast_dtype)
+
+    return {
+        "file_path": [s["file_path"] for s in batch],
+        "raw_text": [s["raw_text"] for s in batch],
+        "input_ids": torch.stack([s["input_ids"] for s in batch]),
+        "attention_mask": torch.stack([s["attention_mask"] for s in batch]),
+        "images": images,  # [B, Tm, image_tokens_per_image, 768]
+        "token_count": token_allocations
+    }
 
 def get_tcga_dataset(args, tokenizer, feature_loader, epoch=0, floor=False):
-    """
-    Initialize a DataLoader for the Llama dataset with epoch synchronization and meta-data.
-
-    Args:
-        args: Arguments with configurations like batch size.
-        tokenizer: Tokenizer object for text preprocessing.
-        feature_loader (function): Function to load preprocessed image features from h5 files.
-        epoch (int): Current epoch index.
-        floor (bool): Whether to round down the number of batches.
-
-    Returns:
-        DataInfo: Contains the DataLoader, sampler, and shared_epoch.
-    """
-    
     shared_epoch = SharedEpoch(epoch=epoch)
 
-
-    path_dataset = PathDataset(
-    jsonl_file=args.tcga_jsonl_file,
-    tokenizer=tokenizer,
-    feature_loader=feature_loader,
-    max_tokens=getattr(args, "max_tokens", 256),  # Fallback to 256 if max_tokens is missing
+    dataset = PathDataset(
+        jsonl_file=args.tcga_jsonl_file,
+        tokenizer=tokenizer,
+        feature_loader=feature_loader,
+        cohort="tcga",
+        max_tokens=args.max_tokens,
+        min_images=args.tcga_min_num_images,
+        max_images=args.tcga_max_num_images,
     )
-
-    num_samples = args.train_num_samples_tcga if hasattr(args, "train_num_samples_tcga") else len(path_dataset)
-    global_batch_size = args.batch_size_tcga * args.world_size
-    round_fn = math.floor if floor else math.ceil
-    num_batches = round_fn(num_samples / global_batch_size)
-    num_samples = num_batches * global_batch_size
 
     sampler = None
     if args.world_size > 1:
         sampler = DistributedSampler(
-            path_dataset,
+            dataset,
             num_replicas=args.world_size,
-            rank=args.rank,  # Rank of the current process
-            shuffle=(shared_epoch.get_value() == 0),  # Shuffle only for the first epoch
+            rank=args.rank,
+            shuffle=(shared_epoch.get_value() == 0)
         )
 
+    global_batch_size = args.batch_size_tcga * args.world_size
+    num_samples = args.train_num_samples_tcga
+    round_fn = math.floor if floor else math.ceil
+    num_batches = round_fn(num_samples / global_batch_size)
+    num_samples = num_batches * global_batch_size
+
     dataloader = DataLoader(
-        path_dataset,
+        dataset,
         batch_size=args.batch_size_tcga,
-        sampler=sampler,  # DistributedSampler ensures each worker processes unique data
-        shuffle=sampler is None,  # Shuffle if no sampler is used
+        sampler=sampler,
+        shuffle=(sampler is None),
         num_workers=args.workers,
         drop_last=True,
         persistent_workers=True,
+        collate_fn=lambda x: greedy_collate_fn(
+        x, max_total_image_tokens=args.tcga_max_num_images, min_images=args.tcga_min_num_images, cast_dtype=get_cast_dtype(args.precision)
+        )
     )
 
     dataloader.num_batches = num_batches
@@ -175,60 +219,50 @@ def get_tcga_dataset(args, tokenizer, feature_loader, epoch=0, floor=False):
     return DataInfo(dataloader=dataloader, sampler=sampler, shared_epoch=shared_epoch)
 
 def get_gtex_dataset(args, tokenizer, feature_loader, epoch=0, floor=False):
-    """
-    Initialize a DataLoader for the Llama dataset with epoch synchronization and meta-data.
-
-    Args:
-        args: Arguments with configurations like batch size.
-        tokenizer: Tokenizer object for text preprocessing.
-        feature_loader (function): Function to load preprocessed image features from h5 files.
-        epoch (int): Current epoch index.
-        floor (bool): Whether to round down the number of batches.
-
-    Returns:
-        DataInfo: Contains the DataLoader, sampler, and shared_epoch.
-    """
-    
     shared_epoch = SharedEpoch(epoch=epoch)
 
-    path_dataset = PathDataset(
-    jsonl_file=args.gtex_jsonl_file,
-    tokenizer=tokenizer,
-    feature_loader=feature_loader,
-    max_tokens=getattr(args, "max_tokens", 256),  # Fallback to 256 if max_tokens is missing
+    dataset = PathDataset(
+        jsonl_file=args.gtex_jsonl_file,
+        tokenizer=tokenizer,
+        feature_loader=feature_loader,
+        cohort="gtex",
+        max_tokens=args.max_tokens,
+        min_images=args.gtex_min_num_images,
+        max_images=args.gtex_max_num_images,
     )
-
-    num_samples = args.train_num_samples_gtex if hasattr(args, "train_num_samples_gtex") else len(path_dataset)
-    global_batch_size = args.batch_size_gtex * args.world_size
-    round_fn = math.floor if floor else math.ceil
-    num_batches = round_fn(num_samples / global_batch_size)
-    num_samples = num_batches * global_batch_size
 
     sampler = None
     if args.world_size > 1:
         sampler = DistributedSampler(
-            path_dataset,
+            dataset,
             num_replicas=args.world_size,
-            rank=args.rank,  # Rank of the current process
-            shuffle=(shared_epoch.get_value() == 0),  # Shuffle only for the first epoch
+            rank=args.rank,
+            shuffle=(shared_epoch.get_value() == 0)
         )
 
-    # Create a DataLoader
+    global_batch_size = args.batch_size_gtex * args.world_size
+    num_samples = args.train_num_samples_gtex
+    round_fn = math.floor if floor else math.ceil
+    num_batches = round_fn(num_samples / global_batch_size)
+    num_samples = num_batches * global_batch_size
+
     dataloader = DataLoader(
-        path_dataset,
+        dataset,
         batch_size=args.batch_size_gtex,
-        sampler=sampler,  # DistributedSampler ensures each worker processes unique data
-        shuffle=sampler is None,  # Shuffle if no sampler is used
+        sampler=sampler,
+        shuffle=(sampler is None),
         num_workers=args.workers,
         drop_last=True,
         persistent_workers=True,
+        collate_fn=lambda x: greedy_collate_fn(
+            x, max_total_image_tokens=args.gtex_max_num_images, min_images=args.gtex_min_num_images, cast_dtype=get_cast_dtype(args.precision)
+            )
     )
 
     dataloader.num_batches = num_batches
     dataloader.num_samples = num_samples
 
     return DataInfo(dataloader=dataloader, sampler=sampler, shared_epoch=shared_epoch)
-
 
 def get_dataset_fn(dataset_type):
     """
