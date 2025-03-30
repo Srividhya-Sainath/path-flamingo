@@ -16,28 +16,21 @@ from einops import rearrange
 
 def create_feature_loader(base_path):
     """
-    Creates a feature loader function that searches for files in a given base path.
+    Creates a feature loader function that searches for files in a given base path. 
     Args:
         base_path (str): The root directory where feature files are stored.
     Returns:
-        function: A feature loader function.
+        function: A feature loader function that returns torch.FloatTensor of shape [Tm, image_tokens_per_image, 768]
     """
     def feature_loader(file_path):
-        """
-        Load features from an h5 file located in the base path.
-        Args:
-            file_path (str): Relative file path from the JSONL file.
-        Returns:
-            np.ndarray: Features loaded from the h5 file.
-        """
         full_path = os.path.join(base_path, file_path)
-        
         if not os.path.exists(full_path):
             raise FileNotFoundError(f"Feature file not found: {full_path}")
         with h5py.File(full_path, "r") as h5_file:
             features = h5_file["feats"][:]
-        return features
-
+            if features.ndim == 1:
+                features = features.reshape(1, -1)  # shape becomes [1, 768]
+        return torch.tensor(features, dtype=torch.float32)  # shape [image_tokens_per_image, 768]
     return feature_loader
 
 def get_cast_dtype(precision: str):
@@ -59,9 +52,12 @@ def get_mp_policy_dtype(precision: str):
 
 
 def get_autocast(precision, cache_enabled=True):
-    if precision == "amp":
-        return torch.cuda.amp.autocast(cache_enabled=cache_enabled)
-    elif precision == "amp_bfloat16" or precision == "amp_bf16":
+    #if precision == "amp":
+    if precision in ["amp", "amp_fp16", "fp16"]:
+        return lambda: torch.cuda.amp.autocast(dtype=torch.float16, cache_enabled=cache_enabled)
+        #return torch.cuda.amp.autocast(cache_enabled=cache_enabled)
+    #elif precision == "amp_bfloat16" or precision == "amp_bf16":
+    elif precision in ["amp_bfloat16", "amp_bf16"]:
         # amp_bfloat16 is more stable than amp float16 for clip training
         return lambda: torch.cuda.amp.autocast(
             dtype=torch.bfloat16, cache_enabled=cache_enabled
@@ -85,6 +81,8 @@ def train_one_epoch(
     # setup loaders
     num_batches_per_epoch_tcga = tcga_loader.num_batches
     num_batches_per_epoch_gtex = gtex_loader.num_batches
+    print("Number of batches in TCGA dataset: ", num_batches_per_epoch_tcga)
+    print("Number of batches in GTEX dataset: ", num_batches_per_epoch_gtex)
     assert (
         num_batches_per_epoch_tcga == num_batches_per_epoch_gtex
     ), "Number of batches in TCGA and GTEX datasets must be the same"
@@ -120,14 +118,16 @@ def train_one_epoch(
 
         #### TCGA FORWARD PASS ####
         #images = batch_tcga[0].to(device_id, dtype=cast_dtype, non_blocking=True) ## Nahi chahiye
-        images = batch_tcga["image"].to(device_id, dtype=cast_dtype, non_blocking=True) ## (batch_size, feature_dim)
+        images = batch_tcga["images"].to(device_id, dtype=cast_dtype, non_blocking=True) ## (batch_size, feature_dim)
         #images = rearrange(images, "(b t f) c h w -> b t f c h w", t=1, f=1) ## Nahi chahiye
         #input_ids = batch_tcga[1][0].to(device_id, dtype=cast_dtype, non_blocking=True)
-        input_ids = batch_tcga["input_ids"].to(device_id, dtype=cast_dtype, non_blocking=True)
+        # input_ids = batch_tcga["input_ids"].to(device_id, dtype=cast_dtype, non_blocking=True)
+        input_ids = batch_tcga["input_ids"].to(device_id, non_blocking=True)
         # attention_mask = batch_tcga[1][1].to(
         #     device_id, dtype=cast_dtype, non_blocking=True
         # )
-        attention_mask = batch_tcga["attention_mask"].to(device_id, dtype=cast_dtype, non_blocking=True)
+        # attention_mask = batch_tcga["attention_mask"].to(device_id, dtype=cast_dtype, non_blocking=True)
+        attention_mask = batch_tcga["attention_mask"].to(device_id, non_blocking=True)
 
         # set up labels; language model is expected to handle shifting
         labels = input_ids.clone()
@@ -149,45 +149,20 @@ def train_one_epoch(
 
         #### GTEX FORWARD PASS ####
         #images = batch_gtex[0].to(device_id, dtype=cast_dtype, non_blocking=True) # Nahi chahiye
-        images = batch_gtex["image"].to(device_id, dtype=cast_dtype, non_blocking=True) ## (batch_size, feature_dim)
+        images = batch_gtex["images"].to(device_id, dtype=cast_dtype, non_blocking=True) ## (batch_size, feature_dim)
         #images = rearrange(images, "b (t f) c h w -> b t f c h w", f=1) #Nahi chahiye
         # input_ids = torch.stack([x[0] for x in batch_gtex[1]]).squeeze(1)
         # attention_mask = torch.stack([x[1] for x in batch_gtex[1]]).squeeze(1)
-        input_ids = batch_gtex["input_ids"].to(device_id, dtype=cast_dtype, non_blocking=True)
-        attention_mask = batch_gtex["attention_mask"].to(device_id, dtype=cast_dtype, non_blocking=True)
+        #input_ids = batch_gtex["input_ids"].to(device_id, dtype=cast_dtype, non_blocking=True)
+        input_ids = batch_gtex["input_ids"].to(device_id, non_blocking=True)
+        #attention_mask = batch_gtex["attention_mask"].to(device_id, dtype=cast_dtype, non_blocking=True)
+        attention_mask = batch_gtex["attention_mask"].to(device_id, non_blocking=True)
 
         # set up labels; language model is expected to handle shifting
         labels = input_ids.clone()
         labels[labels == tokenizer.pad_token_id] = -100
         labels[labels == media_token_id] = -100
         labels = labels.to(device_id)
-
-        ## Zaroori nahi hai. Yeh sab kyun kiza hai.
-        ## Tokens before the first <image> token are masked out.
-        ## Tokens after the last <endofchunk> token in a segment are also masked out.
-        ## Itna kyunking inka Text GPT see aaya.
-        # for i in range(labels.shape[0]):
-        #     # remove loss for any token before the first <image> token
-        #     label_idx = 0
-            # while (
-            #     label_idx < labels.shape[1] and labels[i][label_idx] != media_token_id
-            # ):
-            #     labels[i][label_idx] = -100
-            #     label_idx += 1
-
-            # # get index of all endofchunk tokens in the sequence
-            # endofchunk_idxs = torch.where(labels[i] == endofchunk_token_id)[0]
-            # for endofchunk_idx in endofchunk_idxs:
-            #     token_idx = endofchunk_idx + 1
-            #     while (
-            #         token_idx < labels.shape[1]
-            #         and labels[i][token_idx] != media_token_id
-            #     ):
-            #         labels[i][token_idx] = -100
-            #         token_idx += 1
-
-        # labels[labels == media_token_id] = -100
-        # labels = labels.to(device_id)
 
         # gradient accumulation w/ fsdp cpu offloading requires a no_sync context manager
         with autocast():
