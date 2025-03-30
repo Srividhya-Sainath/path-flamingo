@@ -6,9 +6,12 @@ import os
 import random
 
 import numpy as np
+
 import torch
+torch.cuda.empty_cache()
+
 import wandb
-from path_flamingo.train.data import get_data
+from open_flamingo.train.data import get_data
 from distributed import init_distributed_device, world_info_from_env
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -40,7 +43,7 @@ from torch.distributed.fsdp._init_utils import _init_intra_and_inter_node_groups
 from torch.distributed.distributed_c10d import _get_default_group
 import functools
 
-from path_flamingo import create_model_and_transforms
+from open_flamingo import create_model_and_transforms
 
 
 def random_seed(seed=42, rank=0):
@@ -51,14 +54,11 @@ def random_seed(seed=42, rank=0):
 
 def main():
     parser = argparse.ArgumentParser()
-    # model configuration args
-    # parser.add_argument("--vision_encoder_path", default="ViT-L-14", type=str)
-    # parser.add_argument("--vision_encoder_pretrained", default="openai", type=str)
     parser.add_argument("--lm_path", default="facebook/opt-1.3b", type=str)
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=256,  # Match the default in PathDataset
+        default=64,  # Match the default in PathDataset
         help="Maximum number of tokens to process for each input",
         )
     parser.add_argument(
@@ -96,7 +96,7 @@ def main():
     parser.add_argument("--batch_size_gtex", type=int, default=128)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--learning_rate", default=1e-4, type=float)
+    parser.add_argument("--learning_rate", default=5e-5, type=float)
     parser.add_argument(
         "--lr_scheduler",
         default="constant",
@@ -106,7 +106,7 @@ def main():
     parser.add_argument("--loss_multiplier_tcga", type=float, default=1.0)
     parser.add_argument("--loss_multiplier_gtex", type=float, default=1.0)
     parser.add_argument("--warmup_steps", default=5000, type=int)
-    parser.add_argument("--weight_decay", default=0.1, type=float)
+    parser.add_argument("--weight_decay", default=0.01, type=float)
     parser.add_argument(
         "--precision",
         choices=["amp_bf16", "amp_bfloat16", "bf16", "fp16", "fp32"],
@@ -134,18 +134,6 @@ def main():
         "--logging_steps", type=int, default=100, help="log loss every n steps"
     )
 
-    # data args
-    # parser.add_argument(
-    #     "--laion_shards",
-    #     type=str,
-    #     help="path to laion shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
-    # )
-    # parser.add_argument(
-    #     "--mmc4_shards",
-    #     type=str,
-    #     help="path to c4 shards, this should be a glob pattern such as /path/to/shards/shard-{0000..0999}.tar",
-    # )
-
     ## data args TCGA and GTEX ka daalna hai
     parser.add_argument(
         "--tcga_vision_features",
@@ -171,24 +159,10 @@ def main():
     parser.add_argument("--train_num_samples_tcga", type=int, default=10000)
     parser.add_argument("--train_num_samples_gtex", type=int, default=10000)
     parser.add_argument("--dataset_resampled", action="store_true")
-    # parser.add_argument(
-    #     "--mmc4_textsim_threshold",
-    #     default=30,
-    #     type=float,
-    #     help="threshold for filtering images in mmc4 based on image-text similarity",
-    # )
-    # parser.add_argument(
-    #     "--mmc4_max_num_images",
-    #     default=6,
-    #     type=int,
-    #     help="max number of images per sequence in mmc4 / chatgpt",
-    # )
-    # parser.add_argument(
-    #     "--mmc4_min_num_images",
-    #     default=1,
-    #     type=int,
-    #     help="min number of images per sequence in mmc4 / chatgpt",
-    # )
+    parser.add_argument("--tcga_max_num_images", default=4, type=int, help="max number of images per sequence in tcga",)
+    parser.add_argument("--tcga_min_num_images",default=1, type=int, help="min number of images per sequence in tcga",)
+    parser.add_argument("--gtex_max_num_images", default=4, type=int, help="max number of images per sequence in gtex",)
+    parser.add_argument("--gtex_min_num_images",default=1, type=int, help="min number of images per sequence in gtex",)
 
     # distributed training args
     parser.add_argument(
@@ -247,14 +221,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate args
-    ## यह दोनों तो पक्का नहीं चाहिए होंगे।
-    # if args.laion_shards.startswith("s3"):
-    #     args.laion_shards = f"pipe:aws s3 cp {args.laion_shards} -"
-
-    # if args.mmc4_shards.startswith("s3"):
-    #     args.mmc4_shards = f"pipe:aws s3 cp {args.mmc4_shards} -"
-
     if args.save_checkpoints_to_wandb and not args.report_to_wandb:
         raise ValueError("save_checkpoints_to_wandb requires report_to_wandb")
 
@@ -288,8 +254,6 @@ def main():
 
     # Initialize model
     model, tokenizer = create_model_and_transforms(
-        # args.vision_encoder_path,
-        # args.vision_encoder_pretrained,
         args.lm_path,
         args.tokenizer_path if args.tokenizer_path else args.lm_path,
         cross_attn_every_n_layers=args.cross_attn_every_n_layers,
